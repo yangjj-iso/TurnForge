@@ -1,15 +1,18 @@
 package io.github.yangjjiso.redyagents.core;
 
 import java.util.concurrent.CancellationException;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicReference;
 
 public final class CancellationToken {
-    private final AtomicBoolean cancelled = new AtomicBoolean();
-    private final AtomicReference<Thread> worker = new AtomicReference<>();
+    private enum StopReason { CANCELLED, TIMED_OUT }
+    private volatile StopReason reason;
+    private Thread worker;
 
     public boolean isCancelled() {
-        return cancelled.get();
+        return reason != null;
+    }
+
+    public boolean isTimedOut() {
+        return reason == StopReason.TIMED_OUT;
     }
 
     public void throwIfCancelled() {
@@ -18,23 +21,34 @@ public final class CancellationToken {
         }
     }
 
-    void attachWorker() {
+    synchronized void attachWorker() {
         Thread current = Thread.currentThread();
-        worker.set(current);
+        worker = current;
         if (isCancelled()) {
             current.interrupt();
         }
     }
 
-    void detachWorker() {
-        worker.compareAndSet(Thread.currentThread(), null);
+    synchronized void detachWorker() {
+        if (worker == Thread.currentThread()) {
+            worker = null;
+        }
     }
 
     void cancel() {
-        cancelled.set(true);
-        Thread current = worker.get();
-        if (current != null) {
-            current.interrupt();
+        stop(StopReason.CANCELLED);
+    }
+
+    void timeout() {
+        stop(StopReason.TIMED_OUT);
+    }
+
+    private synchronized void stop(StopReason requested) {
+        if (reason == null) {
+            reason = requested;
+        }
+        if (worker != null) {
+            worker.interrupt();
         }
     }
 }

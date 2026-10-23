@@ -10,10 +10,17 @@
         <relativePath/>
     </parent>
     <groupId>io.github.yangjjiso</groupId>
-    <artifactId>redy-agents-api</artifactId>
+    <artifactId>turnforge</artifactId>
     <version>0.3.0-SNAPSHOT</version>
-    <name>Redy Agents API</name>
+    <name>TurnForge</name>
     <description>Java Agents API subset with durable sessions and a resumable harness</description>
+    <url>https://github.com/yangjj-iso/TurnForge</url>
+    <licenses>
+        <license>
+            <name>MIT License</name>
+            <url>https://opensource.org/license/mit</url>
+        </license>
+    </licenses>
     <properties>
         <java.version>17</java.version>
     </properties>
@@ -44,6 +51,7 @@
         </dependency>
     </dependencies>
     <build>
+        <finalName>turnforge</finalName>
         <plugins>
             <plugin>
                 <groupId>org.springframework.boot</groupId>

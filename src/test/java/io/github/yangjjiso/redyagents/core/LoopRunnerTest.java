@@ -102,7 +102,8 @@ class LoopRunnerTest {
 
         assertEquals("done", result);
         assertEquals(2, modelCalls.get());
-        assertEquals(List.of("tool.call.started", "tool.call.completed", "message.delta"), events);
+        assertEquals(List.of("model.call.started", "model.call.completed", "tool.call.started",
+                "tool.call.completed", "model.call.started", "model.call.completed", "message.delta"), events);
     }
 
     @Test

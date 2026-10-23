@@ -37,14 +37,13 @@ public class SseStreams {
         LinkedBlockingQueue<Event> queue = new LinkedBlockingQueue<>(QUEUE_CAPACITY);
         AtomicBoolean closed = new AtomicBoolean();
         AtomicReference<Future<?>> writer = new AtomicReference<>();
-        EventSubscription subscription = service.subscribe(sessionID, after, event -> {
-            if (!closed.get() && !queue.offer(event)) {
-                emitter.completeWithError(new IllegalStateException("SSE subscriber is too slow"));
-            }
-        });
+        AtomicReference<EventSubscription> subscription = new AtomicReference<>();
         Runnable cleanup = () -> {
             if (closed.compareAndSet(false, true)) {
-                subscription.close();
+                EventSubscription current = subscription.get();
+                if (current != null) {
+                    current.close();
+                }
                 Future<?> task = writer.get();
                 if (task != null) {
                     task.cancel(true);
@@ -54,6 +53,17 @@ public class SseStreams {
         emitter.onCompletion(cleanup);
         emitter.onTimeout(cleanup);
         emitter.onError(ignored -> cleanup.run());
+        EventSubscription current = service.subscribe(sessionID, after, event -> {
+            if (!closed.get() && !queue.offer(event)) {
+                cleanup.run();
+                emitter.completeWithError(new IllegalStateException("SSE subscriber is too slow"));
+            }
+        });
+        subscription.set(current);
+        if (closed.get()) {
+            current.close();
+            return emitter;
+        }
         writer.set(writers.submit(() -> {
             try {
                 while (!closed.get()) {
@@ -73,8 +83,12 @@ public class SseStreams {
                 // The client disconnected or Spring closed the emitter.
             } finally {
                 cleanup.run();
+                emitter.complete();
             }
         }));
+        if (closed.get()) {
+            writer.get().cancel(true);
+        }
         return emitter;
     }
 

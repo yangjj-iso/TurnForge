@@ -17,7 +17,14 @@ public class ApiErrors {
             case INVALID -> response(HttpStatus.BAD_REQUEST, "invalid_request", error.getMessage());
             case NOT_FOUND -> response(HttpStatus.NOT_FOUND, "not_found", error.getMessage());
             case CONFLICT -> response(HttpStatus.CONFLICT, "conflict", error.getMessage());
-            case UNAVAILABLE -> response(HttpStatus.SERVICE_UNAVAILABLE, "unavailable", error.getMessage());
+            case UNAVAILABLE -> {
+                Map<String, Object> details = new java.util.LinkedHashMap<>();
+                details.put("code", "unavailable");
+                details.put("message", error.getMessage());
+                if (error.sessionId() != null) details.put("session_id", error.sessionId());
+                if (error.turnId() != null) details.put("turn_id", error.turnId());
+                yield ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE).body(Map.of("error", details));
+            }
         };
     }
 

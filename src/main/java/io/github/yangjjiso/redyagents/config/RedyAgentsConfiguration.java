@@ -29,7 +29,7 @@ import org.springframework.context.annotation.Configuration;
 /** Spring composition root; the harness and Cube client remain framework independent. */
 @Configuration(proxyBeanMethods = false)
 @EnableConfigurationProperties({CubeSandboxProperties.class, McpProperties.class,
-        ModelProperties.class})
+        ModelProperties.class, RuntimeProperties.class})
 public class RedyAgentsConfiguration {
     @Bean
     @ConditionalOnProperty(name = "redy.model.base-url")
@@ -60,27 +60,33 @@ public class RedyAgentsConfiguration {
                               ObjectProvider<SessionStore> stores,
                               ObjectProvider<SandboxProvisioner> provisioners,
                               ObjectProvider<CubeSandboxBackend> cubeBackend,
+                              Map<String, Tool> applicationTools,
+                              RuntimeProperties runtime,
                               McpToolRegistry mcpTools) throws IOException {
         CubeSandboxBackend cube = cubeBackend.getIfAvailable();
         Runner runner = runners.getIfAvailable();
         if (runner == null) {
             Model model = models.getIfAvailable();
-            Map<String, Tool> tools = new LinkedHashMap<>();
+            Map<String, Tool> tools = new LinkedHashMap<>(applicationTools);
             if (cube != null) {
-                tools.putAll(SandboxTools.create(cube));
+                SandboxTools.create(cube).forEach((name, tool) -> registerTool(tools, name, tool));
             }
             mcpTools.tools().forEach((name, tool) -> {
-                if (tools.putIfAbsent(name, tool) != null) {
-                    throw new IllegalArgumentException("duplicate tool name: " + name);
-                }
+                registerTool(tools, name, tool);
             });
             runner = new LoopRunner(model == null ? new DemoModel() : model,
-                    tools, 8);
+                    tools, runtime.toLimits().maxSteps());
         }
         SessionStore store = stores.getIfAvailable();
         if (store == null) {
             store = new FileSessionStore(Path.of(dataDir));
         }
-        return new AgentService(runner, store, provisioners.getIfAvailable());
+        return new AgentService(runner, store, provisioners.getIfAvailable(), runtime.toLimits());
+    }
+
+    private static void registerTool(Map<String, Tool> tools, String name, Tool tool) {
+        if (tools.putIfAbsent(name, tool) != null) {
+            throw new IllegalArgumentException("duplicate tool name: " + name);
+        }
     }
 }
