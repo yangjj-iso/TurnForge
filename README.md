@@ -1,4 +1,4 @@
-# Redy Agents API
+# TurnForge
 
 Java 17 / Spring Boot Agents API starter. It provides asynchronous turns, session input events, saved items, cancellation, and Server-Sent Events (SSE). A replaceable model and tool loop sits behind the HTTP API.
 
