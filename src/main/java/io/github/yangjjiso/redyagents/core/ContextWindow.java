@@ -3,8 +3,10 @@ package io.github.yangjjiso.redyagents.core;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.HashSet;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import tools.jackson.core.JacksonException;
 import tools.jackson.databind.ObjectMapper;
 
@@ -73,7 +75,10 @@ public final class ContextWindow {
             throw new IllegalArgumentException("instructions, tools, and latest user input exceed prompt budget");
         }
 
-        List<Message> currentTurn = new ArrayList<>(messages.subList(latestUser, messages.size()));
+        // Steering may insert a user message between a tool call and its result. Such a
+        // message is not a safe compaction boundary: providers require the whole exchange.
+        int protectedStart = protectedStart(messages, latestUser);
+        List<Message> currentTurn = new ArrayList<>(messages.subList(protectedStart, messages.size()));
         long currentCost = fixedCost + messagesCost(currentTurn);
         if (currentCost > promptBudgetTokens) {
             currentCost = trimCurrentTurn(currentTurn, fixedCost, promptBudgetTokens);
@@ -82,7 +87,7 @@ public final class ContextWindow {
             }
         }
 
-        List<Group> historicalGroups = historicalGroups(messages, latestUser);
+        List<Group> historicalGroups = historicalGroups(messages, protectedStart);
         int keptFrom = historicalGroups.size();
         long keptCost = currentCost;
         while (keptFrom > 0) {
@@ -238,15 +243,46 @@ public final class ContextWindow {
         int start = 0;
         while (start < latestUser) {
             int end = start + 1;
-            while (end < latestUser && !"user".equals(messages.get(end).role())) {
+            Set<String> pending = new HashSet<>();
+            trackToolCall(messages.get(start), pending);
+            while (end < latestUser) {
+                Message message = messages.get(end);
+                if ("user".equals(message.role()) && pending.isEmpty()) {
+                    break;
+                }
+                trackToolCall(message, pending);
                 end++;
             }
             boolean complete = "user".equals(messages.get(start).role())
-                    && "assistant".equals(messages.get(end - 1).role());
+                    && "assistant".equals(messages.get(end - 1).role()) && pending.isEmpty();
             groups.add(new Group(start, end, complete));
             start = end;
         }
         return groups;
+    }
+
+    private static int protectedStart(List<Message> messages, int latestUser) {
+        Set<String> pending = new HashSet<>();
+        int start = latestUser;
+        for (int i = 0; i <= latestUser; i++) {
+            Message message = messages.get(i);
+            if ("user".equals(message.role()) && pending.isEmpty()) {
+                start = i;
+            }
+            trackToolCall(message, pending);
+        }
+        return start;
+    }
+
+    private static void trackToolCall(Message message, Set<String> pending) {
+        if (message.callId() == null) {
+            return;
+        }
+        if ("assistant".equals(message.role()) && message.tool() != null && !message.tool().isEmpty()) {
+            pending.add(message.callId());
+        } else if ("tool".equals(message.role())) {
+            pending.remove(message.callId());
+        }
     }
 
     private record Group(int start, int end, boolean complete) {}

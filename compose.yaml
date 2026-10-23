@@ -1,0 +1,12 @@
+services:
+  turnforge:
+    build: .
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - sessions:/data
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+volumes:
+  sessions:

@@ -1,8 +1,8 @@
 openapi: 3.1.0
 info:
-  title: Redy Agents API
+  title: TurnForge
   version: 0.3.0
-  description: Java demo-model service with an Agents API-style session and function-event subset.
+  description: Java Agent Runtime with bounded model/tool execution, durable sessions and replayable events.
 servers:
   - url: http://127.0.0.1:8080
 paths:
@@ -131,6 +131,7 @@ paths:
           $ref: '#/components/responses/NotFound'
     post:
       operationId: startTurn
+      description: Start asynchronous execution. Worker capacity exhaustion returns 503 after saving a failed turn; inspect session history before retrying.
       requestBody:
         required: true
         content:
@@ -157,6 +158,8 @@ paths:
           $ref: '#/components/responses/Conflict'
         '415':
           $ref: '#/components/responses/UnsupportedMediaType'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
   /v1/agents/sessions/{sessionID}/turns/{turnID}:
     parameters:
       - $ref: '#/components/parameters/sessionID'
@@ -194,6 +197,7 @@ paths:
       - $ref: '#/components/parameters/sessionID'
     get:
       operationId: getEvents
+      description: Replay committed events. SSE subscriber capacity exhaustion returns 503; a slow SSE reader is disconnected and may reconnect using its last received event ID.
       parameters:
         - name: after
           in: query
@@ -226,9 +230,11 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '404':
           $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
     post:
       operationId: submitEvents
-      description: Submit user input, a function result, or cancellation. This subset accepts one user text part per message event. Multiple events are validated first, then applied in array order.
+      description: Submit user input, a function result, or cancellation. This subset accepts one user text part per message event. Multiple events are validated first, then applied in array order, without batch atomicity. Worker exhaustion may return 503 after recording a failed turn and accepting a function result; inspect the session before retrying.
       requestBody:
         required: true
         content:
@@ -256,6 +262,8 @@ paths:
           $ref: '#/components/responses/Conflict'
         '415':
           $ref: '#/components/responses/UnsupportedMediaType'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
   /v1/agents/sessions/{sessionID}/items:
     parameters:
       - $ref: '#/components/parameters/sessionID'
@@ -310,7 +318,7 @@ components:
           schema:
             $ref: '#/components/schemas/ErrorResponse'
     ServiceUnavailable:
-      description: CubeSandbox provider is unavailable; a lifecycle action may be retried after checking the session environment state.
+      description: Provider or execution/subscriber capacity is unavailable. A failed worker submission includes error.session_id and error.turn_id, including when session creation supplied initial input. Inspect these resources before retrying.
       content:
         application/json:
           schema:
@@ -325,7 +333,7 @@ components:
           type: string
         model:
           type: string
-          description: Only demo is supported by the bundled model adapter.
+          description: Use demo with the offline adapter, or a provider model ID with the configured Chat Completions adapter.
         instructions:
           type: string
         context_window_tokens:
@@ -588,3 +596,9 @@ components:
               type: string
             message:
               type: string
+            session_id:
+              type: string
+              description: Present when execution capacity was exhausted after persisting the session.
+            turn_id:
+              type: string
+              description: The failed turn associated with a rejected worker submission.

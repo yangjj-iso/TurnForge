@@ -56,7 +56,9 @@ final class TurnExecution {
             cancellation.throwIfCancelled();
             work.run();
         } catch (Throwable failure) {
-            if (cancellation.isCancelled() || failure instanceof CancellationException) {
+            if (cancellation.isTimedOut()) {
+                state.finishTurn(turn, cancellation, "failed", "", "turn execution timed out", null);
+            } else if (cancellation.isCancelled() || failure instanceof CancellationException) {
                 state.finishTurn(turn, cancellation, "cancelled", "", "", null);
             } else {
                 String message = failure.getMessage();

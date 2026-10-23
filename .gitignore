@@ -3,3 +3,8 @@ target/
 *.iml
 .DS_Store
 .redy-data/
+.env
+.env.*
+!.env.example
+__pycache__/
+*.pyc

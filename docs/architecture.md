@@ -1,81 +1,74 @@
-# Architecture
+# Architecture and execution contract
 
-Redy Agents API is a Java 17 Agents API subset. The default `demo` model returns text and does not request tools. An optional OpenAI-compatible Chat Completions adapter can use the registered tools; the controller remains provider independent.
+TurnForge separates transport, session ownership, scheduling, harness execution and provider adapters. `core` has no Spring dependency. `config` is the composition root; `web` translates HTTP into core operations. Existing Java package names and `redy.*` properties remain compatible.
 
 ```mermaid
-flowchart LR
-    HTTP[HTTP / SSE] --> Service[AgentService]
-    Service --> Worker[TurnExecution]
-    Worker --> Runner[Runner / ResumableRunner]
-    Service --> Snapshots[SessionSnapshotRepository]
-    Snapshots --> Snapshot[SessionSnapshot]
-    Service --> Provisioner[SandboxProvisioner]
-    Runner --> Model[Model]
-    Model --> Provider[Chat Completions provider]
-    Runner --> Tools[Tool registry]
-    Runner --> Context[ContextWindow]
-    Tools --> MCP[McpToolRegistry]
-    MCP --> MCPClient[Official MCP Java SDK]
-    MCPClient --> Stdio[stdio process]
-    MCPClient --> Remote[Streamable HTTP server]
-    Snapshots --> Store[SessionStore]
-    Provisioner --> CubeAdapter[CubeSandboxBackend]
-    Tools --> CubeAdapter
-    CubeAdapter --> CubeClient[CubeSandboxClient]
-    CubeClient --> Control[CubeControlClient]
-    CubeClient --> Envd[CubeEnvdClient]
-    Envd --> Codec[CubeProcessStreamCodec]
+flowchart TD
+    HTTP["HTTP / SSE"] --> Service["AgentService: session transitions"]
+    Service --> Store["SessionSnapshotRepository / SessionStore"]
+    Service --> Scheduler["TurnScheduler: workers and deadlines"]
+    Scheduler --> Execution["TurnExecution: terminal outcome"]
+    Execution --> Harness["LoopRunner: bounded model/tool loop"]
+    Harness --> Context["ContextWindow: prompt budget"]
+    Harness --> Model["Model adapter"]
+    Harness --> Tools["Application / MCP / sandbox tools"]
 ```
 
-| Boundary | Owner | Responsibility |
+| Boundary | Owner | Contract |
 | --- | --- | --- |
-| HTTP | `web` | Request validation, response mapping, event stream transport |
-| Session orchestration | `core.AgentService`, `core.TurnExecution` | Session and turn transitions, worker scheduling, worker execution, event ordering, recovery decisions |
-| Harness | `core.Runner`, `core.ResumableRunner`, `core.LoopRunner` | Model/tool loop, checkpoints, context budget, duplicate-call handling |
-| Model adapter | `core.OpenAiCompatibleModel` | Serialize prompt and function tools, call a configured Chat Completions endpoint, parse text or one tool call |
-| Persistence | `core.SessionSnapshot`, `core.SessionSnapshotRepository`, `core.SessionStore` | Snapshot schema, encoding, and durable storage; the file implementation writes one snapshot per session |
-| Sandbox port | `core.SandboxProvisioner`, `core.SandboxToolBackend` | Provider-independent lifecycle and tool operations |
-| Cube adapter | `cube.CubeSandboxBackend`, `cube.SandboxTools` | Bind a session's sandbox ID to the ports and the shell/file tools |
-| Cube protocol | `cube.CubeSandboxClient` and package-private collaborators | CubeAPI control requests, CubeProxy/envd requests, Connect stream frames |
-| MCP adapter | `mcp.McpToolRegistry` and MCP client collaborators | Connect configured servers at startup, discover and name tools, adapt calls and results, close clients |
-| Composition | `config` | Bind deployment settings; use registered `Runner`, `SessionStore`, and `SandboxProvisioner` beans when provided, or assemble defaults with CubeSandbox and MCP tools |
+| HTTP validation and event transport | `web` | Strict JSON requests, stable error envelope, replay cursors, bounded SSE buffer |
+| Session transactions | `AgentService` | One active turn per session; items, state and events persist together before acknowledgment |
+| Worker resources | `TurnScheduler`, `RuntimeLimits` | Bounded concurrency/queue; cooperative execution deadline; deterministic shutdown |
+| Terminal outcomes | `TurnExecution` | Completed, cancelled or failed; timeout is failed, user cancellation is cancelled |
+| Agent harness | `LoopRunner`, `ResumableRunner` | Step budget, model decisions, tool validation, retry/dedup, context and external handoff checkpoints |
+| Model context | `ContextWindow` | Reserve instructions, tool schemas and output budget; preserve tool exchanges; compact older groups |
+| Storage | `SessionSnapshotRepository`, `FileSessionStore` | Session snapshot encoding; temporary write, file fsync, atomic replacement |
+| Integrations | `OpenAiCompatibleModel`, `mcp`, `cube` | Provider details stay outside HTTP/session logic |
 
-## Session and turn flow
+## State ownership
 
-1. `POST /v1/agents/sessions` validates the agent and optional environment. For `cube`, the provider creates a sandbox. `AgentService` saves the sandbox ID in the session snapshot before returning it.
-2. A turn saves its input and state, then a worker calls the runner. A `ResumableRunner` produces a checkpoint before each continuation; the bundled `LoopRunner` budgets context, asks the model for a decision, and dispatches registered tools.
-3. A local tool receives `ToolExecutionContext` with the session and call ID. Cube tools require an active Cube environment and use only that session's sandbox ID. MCP tools dispatch to the configured server under a stable `mcp__<server>__<tool>` name. A pending application-owned function instead moves the session to `requires_action` until a result arrives through `/events`.
-4. Events and items are persisted with the session and can be replayed by sequence. On restart, a waiting function remains waiting. An interrupted turn with uncertain effects is failed rather than blindly replayed.
-5. Pause, resume, and kill write a durable transition state (`pausing`, `resuming`, `killing`) before calling CubeAPI. While in a transition, the session cannot start a turn. Retrying the same endpoint reconciles an interrupted lifecycle call.
+A session is `idle`, `in_progress`, or `requires_action`. A turn is `in_progress`, `waiting`, `cancelling`, or terminal (`completed`, `failed`, `cancelled`). Queued work currently uses `in_progress` at the API layer until a worker enters the harness. A terminal turn moves the session to idle; idle does not imply success.
 
-The [OpenAPI contract](../api/openapi.yaml) describes the HTTP surface. `environment`, lifecycle endpoints, and replay cursors are local extensions to the Agents API subset.
+`AgentService` holds a process lock while updating in-memory state and committing its snapshot. It rolls back the affected state if persistence fails. Model calls, tool execution and sandbox lifecycle network calls happen outside that lock. Event consumers only see committed events; delivery callbacks run outside the lock. A complete snapshot includes session/turn state, conversation context, execution items, event history, external results, steering claims and checkpoints.
 
-## Extension points
+`TurnScheduler` bounds workers and queued tasks. Overload records a failed turn and returns `503`; rejected work never calls a model or tool. Each execution segment starts a deadline when its worker begins and cancels its timer on exit. External waiting releases the worker. Resuming has a fresh time allowance and the persisted total step count. Timeouts and cancellation interrupt cooperatively. A noncooperative adapter can keep its worker occupied; terminal status must not imply a remote side effect was rolled back.
 
-- Set `redy.model.base-url` and `redy.model.api-key` to register the Chat Completions adapter, or provide a custom Spring `Model` bean. Without either, composition uses `DemoModel`. The model ID comes from each session's `AgentConfig.model`.
-- Register a Spring `Runner` bean for a simple one-shot turn or `ResumableRunner` for checkpointed function handoff and restart recovery. The default runner is `LoopRunner`.
-- Register tools in the `LoopRunner` tool map. A tool may validate arguments and results; `ToolFailure` is returned to the model as feedback. Shell exit codes are command results, including nonzero codes.
-- Configure `redy.mcp.servers` for external stdio or Streamable HTTP tools. The Spring composition root creates a `McpToolRegistry` bean, discovers tools at startup, and merges them into the default runner. A custom runner can inject that registry and decide which tools to expose. The demo model does not call tools.
-- Register a Spring `SessionStore` bean to replace the local file store. Register `SandboxProvisioner` and a suitable runner/tool backend to replace CubeSandbox.
+## Tool protocol
 
-## TokenHub and Kimi K3 model state
+1. Fit instructions, messages and tool metadata into the prompt budget; claim steering at the next model boundary.
+2. Record `model.call.started` and outcome with step, model and elapsed time. These events expose timing, not provider reasoning or exact token accounting.
+3. Validate the selected tool and its arguments. Persist a function-call item before invoking a local/MCP/sandbox side effect.
+4. Execute through `ToolExecutionContext` (session and call ID), validate the result and save its paired output. Cancellation/failure pairs unanswered calls with failure outputs so subsequent model requests remain well formed.
+5. A repeated call ID with identical signature reuses its cached result within the checkpoint; a changed signature fails. A failed signature gets at most one model-requested retry when the tool is idempotent and the failure is retryable. The runtime never automatically retries arbitrary side effects.
+6. An `ExternalFunctionTool` saves a waiting checkpoint and `required_actions`. `/events` validates the turn/call identity, stores its result and resumes. Duplicate identical results are accepted; conflicting duplicates are rejected.
 
-The Java adapter accepts an OpenAI-compatible base URL. For a Tencent TokenHub enterprise plan/v3 deployment, `https://tokenhub.tencentmaas.com/plan/v3` is the documented Guangzhou base URL; `OpenAiCompatibleModel` appends `/chat/completions`. A session selects `kimi-k3` through `AgentConfig.model`, subject to the configured key's model access. The [README](../README.md#remote-model) shows a private local environment file outside the repository; Spring reads the exported variables when Maven starts and does not load that file itself. The endpoint and model availability are deployment settings, not harness constants. See the [TokenHub plan documentation](https://cloud.tencent.com/document/product/1823/130659) and [Kimi calling guide](https://cloud.tencent.com/document/product/1823/132232).
+Tool schemas describe inputs to the model. Tools must implement semantic validation themselves. Unknown tools and malformed provider decisions fail the turn. Model responses with multiple parallel tool calls fail explicitly. Cancellation of an MCP request ends the local wait; the server may continue executing.
 
-For the exact model ID `kimi-k3`, the adapter maps `AgentConfig.maxOutputTokens` to `max_completion_tokens`. Other models receive `max_tokens`. The same `maxOutputTokens` value is also reserved by `ContextWindow` before assembling the prompt, with an additional 128-token safety margin. The demo defaults of 4,096 context and 512 output tokens are small for K3 because reasoning and the final answer consume the same completion allowance. An illustrative K3 session can use 65,536 context and 16,384 output tokens, leaving an estimated 49,024-token prompt budget. This estimator is based on UTF-8 bytes, not the provider's tokenizer; a model-specific tokenizer and compressor remain extension points.
+## Context and steering
 
-The adapter reads `reasoning_content` and, when present, `reasoning_details` from an assistant response into `Decision.modelState`. `LoopRunner` attaches that state to the assistant `Message` for final text and tool calls. The session snapshot stores those messages; the next Chat Completions request writes the retained reasoning fields back with the assistant message and pairs a tool result using `tool_call_id`. This supports K3's multi-turn and tool-call continuity for the text/function subset while those messages remain in model context; unknown provider-specific assistant fields are not replayed. `ContextWindow` includes model state in its budget and may compact older messages. The adapter is nonstreaming, so it does not expose live reasoning deltas. Snapshot files can contain reasoning text and should be protected like conversation content.
+The default token estimator conservatively counts UTF-8 bytes plus message overhead. Tools, instructions and retained provider reasoning state all consume prompt space. Older groups can be replaced with an extractive summary, and current tool output can be truncated while preserving metadata. User text is not silently shortened. Steering inserted between a tool call and result cannot form a compaction boundary; historical exchanges are also kept or omitted together. An oversized protected turn fails before calling the provider. Original items remain available even when the model-context view is compacted.
 
-## MCP lifecycle and trust boundary
+Replace the estimator/compressor by constructing a `ContextWindow` and supplying it to `LoopRunner`. A production semantic summarizer must manage its own latency, cancellation and cost. The fallback does not claim semantic memory quality.
 
-The registry initializes every configured server before the application is ready, then lists tools with bounded pagination. A failed initialization or discovery aborts startup and closes previously opened clients. With no configured servers, the registry is empty and opens no connections. The tool catalog is a startup snapshot; changing a server's tools requires an application restart. A tool result with MCP `isError: true` remains execution feedback for the model, while transport and protocol failures are handled separately. Request timeouts bound the local wait but do not cancel the remote operation because the [official SDK does not yet implement MCP cancellation notifications](https://java.sdk.modelcontextprotocol.io/latest/client/#request-timeouts-and-cancellation).
+## Recovery decisions
 
-Stdio MCP processes run on the Java host, outside CubeSandbox. The transport clears `ProcessBuilder`'s inherited environment before the SDK adds `ServerParameters.env`, which contains the explicitly configured variables and a small default set such as `PATH` and `HOME`. Service environment variables outside those two sets are not passed to the child process. HTTP servers should use HTTPS and deployment-injected credentials. Tool metadata and output originate from the server and should be treated as untrusted data. This integration currently covers MCP client tools; resources, prompts, sampling, elicitation, and serving an MCP endpoint are not implemented.
+| Durable checkpoint at restart | Recovery |
+| --- | --- |
+| Completed/failed/cancelled turn | History and event identities remain stable |
+| Waiting external function | Preserve `requires_action` and the original call ID; await its result |
+| Safe checkpoint before model/tool dispatch | Resume from that checkpoint |
+| Interrupted in-flight execution | Fail with a reconciliation message; do not replay uncertain effects |
+| Cancelling turn | Complete cancellation and pair unanswered calls |
+| Sandbox pausing/resuming/killing | Keep the transition; retry the same lifecycle endpoint to reconcile |
 
-## Current scaling limits
+A checkpoint is marked unsafe before entering execution. Side effects and local snapshots are not one distributed transaction. Applications must supply their own idempotency or reconciliation keyed by session/turn/call. Creating a Cube sandbox and saving its session are also separate; a process crash between them can orphan a sandbox.
 
-`AgentService` still uses one lock for all sessions. It serializes and writes a complete session snapshot while holding that lock, so a slow disk or a long history can delay unrelated sessions. Context, execution messages, and checkpoint messages also hold overlapping conversation state. Moving to per-session synchronization and an append-only event store is the next architectural step; it requires a storage migration and concurrency tests. The current file store is intended for a single service process.
+## Composition and extension
 
-`ResumableRunner` still exposes `LoopCheckpoint`, so alternate checkpoint formats need a contract change. `ContextWindow` treats the latest user message as the start of the protected current turn; steering submitted during a tool exchange can cause earlier messages in that exchange to be compacted. Each SSE subscription currently uses a writer thread and an event-dispatch thread.
+The default composition merges Spring `Tool` beans, optional Cube tools and discovered MCP tools, rejecting name collisions. `Model`, `Runner`, `SessionStore` and `SandboxProvisioner` are replaceable beans. A supplied runner controls its own tools/context; a supplied store controls durability. MCP discovery completes before readiness and failures close initialized clients and abort startup. An `example-tools` profile adds an external approval tool without changing defaults.
 
-Creating a Cube sandbox and writing the first session snapshot are separate operations. A process crash in that interval can leave an orphan sandbox. The Cube protocol has mock tests, but a live cluster has not been available for end-to-end verification.
+The bundled model adapter speaks nonstreaming OpenAI-compatible Chat Completions. It preserves supported reasoning fields with retained messages, bounds response size and uses per-request timeouts. Provider examples and MCP/Cube trust boundaries are in [providers.md](providers.md).
+
+## Current scaling boundary
+
+Snapshots are whole-session files and the service lock serializes commits across sessions. Event/item history and session count grow until the operator archives the data. One data directory belongs to one service process; no distributed job ownership or cross-process file locking is provided. A per-session lock plus append-only event log, retention/pagination and distributed leases would require storage/concurrency changes and are outside this release. Each SSE subscriber uses a dispatcher and writer thread, bounded by the subscriber limit; slow clients are disconnected and can reconnect using their last committed event ID.

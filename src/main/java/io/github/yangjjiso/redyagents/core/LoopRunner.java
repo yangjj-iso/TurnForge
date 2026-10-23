@@ -157,11 +157,25 @@ public final class LoopRunner implements ResumableRunner {
             step++;
             emit.markSteeringConsumed();
             cancellation.throwIfCancelled();
-            Decision decision = model.next(cancellation, agent, List.copyOf(messages), toolDefinitions);
+            emit.emit("model.call.started", Map.of("step", step, "model", agent.model(),
+                    "estimated_prompt_tokens", context.estimatedTokens()));
+            long started = System.nanoTime();
+            Decision decision;
+            try {
+                decision = model.next(cancellation, agent, List.copyOf(messages), toolDefinitions);
+            } catch (Exception failure) {
+                emit.emit("model.call.failed", Map.of("step", step, "model", agent.model(),
+                        "elapsed_ms", (System.nanoTime() - started) / 1_000_000,
+                        "cancelled", cancellation.isCancelled()));
+                throw failure;
+            }
             cancellation.throwIfCancelled();
             if (decision == null) {
                 throw new IllegalStateException("model returned no decision");
             }
+            emit.emit("model.call.completed", Map.of("step", step, "model", agent.model(),
+                    "elapsed_ms", (System.nanoTime() - started) / 1_000_000,
+                    "decision", decision.kind()));
             if ("final".equals(decision.kind())) {
                 String response = decision.message() == null ? "" : decision.message();
                 List<String> steering = step >= maxSteps ? List.of() : drainSteering(emit);

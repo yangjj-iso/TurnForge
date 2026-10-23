@@ -12,8 +12,10 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.SynchronousQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.function.Consumer;
 import java.util.HexFormat;
 import tools.jackson.databind.ObjectMapper;
@@ -28,8 +30,8 @@ public final class AgentService implements AutoCloseable {
     private final SessionSnapshotRepository snapshots;
     private final SandboxProvisioner sandboxProvisioner;
     private final ObjectMapper json = new ObjectMapper();
-    private final ExecutorService turnExecutor = Executors.newCachedThreadPool(daemonThreads("redy-turn-"));
-    private final ExecutorService eventExecutor = Executors.newCachedThreadPool(daemonThreads("redy-events-"));
+    private final TurnScheduler turnExecutor;
+    private final ExecutorService eventExecutor;
     private boolean closed;
 
     public AgentService() {
@@ -45,9 +47,18 @@ public final class AgentService implements AutoCloseable {
     }
 
     public AgentService(Runner runner, SessionStore store, SandboxProvisioner sandboxProvisioner) {
+        this(runner, store, sandboxProvisioner, RuntimeLimits.defaults());
+    }
+
+    public AgentService(Runner runner, SessionStore store, SandboxProvisioner sandboxProvisioner,
+                         RuntimeLimits limits) {
         if (runner == null) {
             throw new IllegalArgumentException("runner is required");
         }
+        this.turnExecutor = new TurnScheduler(limits);
+        this.eventExecutor = new ThreadPoolExecutor(0, limits.maxSubscribers(), 60L, TimeUnit.SECONDS,
+                new SynchronousQueue<>(), TurnScheduler.threads("turnforge-events-"),
+                new ThreadPoolExecutor.AbortPolicy());
         this.resumableRunner = runner instanceof ResumableRunner resumable ? resumable : null;
         this.turnExecution = new TurnExecution(runner, resumableRunner, new TurnExecution.State() {
             @Override
@@ -74,7 +85,12 @@ public final class AgentService implements AutoCloseable {
         });
         this.snapshots = store == null ? null : new SessionSnapshotRepository(store);
         this.sandboxProvisioner = sandboxProvisioner;
-        restore();
+        try {
+            restore();
+        } catch (RuntimeException failure) {
+            close();
+            throw failure;
+        }
     }
 
     public Session createSession(AgentConfig agent) {
@@ -328,15 +344,16 @@ public final class AgentService implements AutoCloseable {
         List<Message> completedHistory = List.copyOf(history);
         try {
             if (resumableRunner != null) {
-                turnExecutor.execute(() -> turnExecution.runResumable(
+                turnExecutor.execute(cancellation, () -> turnExecution.runResumable(
                         cancellation, runnerSession, checkpoint, turn));
             } else {
-                turnExecutor.execute(() -> turnExecution.runPlain(
+                turnExecutor.execute(cancellation, () -> turnExecution.runPlain(
                         cancellation, runnerSession, completedHistory, turn));
             }
         } catch (RuntimeException rejected) {
             finishTurn(turn, cancellation, "failed", "", "worker unavailable", null);
-            throw rejected;
+            throw AgentException.unavailable("turn worker capacity exhausted; retry after active turns finish",
+                    sessionId, turn.id());
         }
         return turn;
     }
@@ -515,11 +532,12 @@ public final class AgentService implements AutoCloseable {
         }
         LoopCheckpoint resumeFrom = checkpoint;
         try {
-            turnExecutor.execute(() -> turnExecution.runResumable(
+            turnExecutor.execute(cancellation, () -> turnExecution.runResumable(
                     cancellation, runnerSession, resumeFrom, turn));
         } catch (RuntimeException rejected) {
             finishTurn(turn, cancellation, "failed", "", "worker unavailable", null);
-            throw rejected;
+            throw AgentException.unavailable("turn worker capacity exhausted; inspect the failed turn before retrying",
+                    sessionId, turnId);
         }
         return getSession(sessionId);
     }
@@ -633,7 +651,7 @@ public final class AgentService implements AutoCloseable {
             eventExecutor.execute(subscription::dispatch);
         } catch (RuntimeException e) {
             subscription.close();
-            throw e;
+            throw AgentException.unavailable("event subscriber capacity exhausted");
         }
         return subscription;
     }
@@ -859,10 +877,14 @@ public final class AgentService implements AutoCloseable {
                     || "cancelling".equals(current.status()) || "waiting".equals(current.status()))) {
                 return;
             }
-            if ("cancelling".equals(current.status()) || cancellation.isCancelled()) {
+            if ("cancelling".equals(current.status()) || (cancellation.isCancelled() && !cancellation.isTimedOut())) {
                 status = "cancelled";
                 output = "";
                 error = "";
+            } else if (cancellation.isTimedOut()) {
+                status = "failed";
+                output = "";
+                error = "turn execution timed out";
             }
             Session oldSession = state.session;
             List<Message> oldContext = state.context;
@@ -1136,9 +1158,15 @@ public final class AgentService implements AutoCloseable {
             state.cancellation = cancellation;
             Session session = state.session;
             LoopCheckpoint checkpoint = state.checkpoint;
-            turnExecutor.execute(() -> turnExecution.runResumable(
-                    cancellation, session, checkpoint, turn));
-            return;
+            try {
+                turnExecutor.execute(cancellation, () -> turnExecution.runResumable(
+                        cancellation, session, checkpoint, turn));
+                return;
+            } catch (RejectedExecutionException overloaded) {
+                // A backlog of safe checkpoints must not prevent the service from starting.
+                // Fail this turn through normal recovery so clients can explicitly retry it.
+                state.cancellation = null;
+            }
         }
         boolean wasCancelling = "cancelling".equals(turn.status());
         String outcome = wasCancelling ? "cancelled" : "failed";
@@ -1250,19 +1278,6 @@ public final class AgentService implements AutoCloseable {
         return new AgentException(AgentException.Reason.CONFLICT, "session already has an active turn");
     }
 
-    private static ThreadFactory daemonThreads(String prefix) {
-        return new ThreadFactory() {
-            private int nextId;
-
-            @Override
-            public synchronized Thread newThread(Runnable task) {
-                Thread thread = new Thread(task, prefix + ++nextId);
-                thread.setDaemon(true);
-                return thread;
-            }
-        };
-    }
-
     @Override
     public void close() {
         List<Subscription> subscriptions = new ArrayList<>();
@@ -1285,7 +1300,7 @@ public final class AgentService implements AutoCloseable {
         for (CancellationToken cancellation : cancellations) {
             cancellation.cancel();
         }
-        turnExecutor.shutdownNow();
+        turnExecutor.close();
         eventExecutor.shutdownNow();
     }
 

@@ -14,6 +14,44 @@ class ContextWindowTest {
     private final ContextWindow window = new ContextWindow();
 
     @Test
+    void steeringInsideToolExchangeCannotSplitCurrentCallFromItsResult() {
+        List<Message> messages = List.of(
+                new Message("user", "old".repeat(100)), new Message("assistant", "old reply"),
+                new Message("user", "lookup"),
+                new Message("assistant", "", "lookup", "call_1", "e30=", null),
+                new Message("user", "please be concise"),
+                new Message("tool", "result".repeat(100), "lookup", "call_1", "e30=", true));
+
+        ContextWindow.Result fitted = window.fit(messages, "", 200);
+
+        assertEquals(2, fitted.omittedMessages());
+        assertTrue(fitted.messages().stream().anyMatch(m -> "assistant".equals(m.role())
+                && "call_1".equals(m.callId())));
+        assertTrue(fitted.messages().stream().anyMatch(m -> "tool".equals(m.role())
+                && "call_1".equals(m.callId())));
+        assertTrue(fitted.messages().contains(messages.get(4)));
+        assertTrue(fitted.estimatedTokens() <= 200);
+    }
+
+    @Test
+    void historicalSteeredExchangeIsKeptOrOmittedAsOneGroup() {
+        List<Message> messages = List.of(
+                new Message("user", "x".repeat(300)), new Message("assistant", "old"),
+                new Message("user", "lookup"),
+                new Message("assistant", "", "lookup", "call_1", "e30=", null),
+                new Message("user", "steering"),
+                new Message("tool", "result", "lookup", "call_1", "e30=", true),
+                new Message("assistant", "done"), new Message("user", "now"));
+
+        for (int budget : List.of(90, 180, 250)) {
+            ContextWindow.Result fitted = window.fit(messages, "", budget);
+            long callMessages = fitted.messages().stream().filter(m -> "call_1".equals(m.callId())).count();
+            assertTrue(callMessages == 0 || callMessages == 2, fitted.messages().toString());
+            assertTrue(fitted.estimatedTokens() <= budget);
+        }
+    }
+
+    @Test
     void leavesMessagesUnchangedWhenTheyFit() {
         List<Message> original = List.of(
                 new Message("user", "earlier"), new Message("assistant", "reply"),
